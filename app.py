@@ -4,8 +4,8 @@ import subprocess, os, socket, struct, json, threading, time
 app = Flask(__name__)
 
 # ─── Konfiguration ────────────────────────────────────────────────────────────
-SERVER_DIR   = "/opt/minecraft"   # <-- Pfad zum Serverordner anpassen
-START_SCRIPT = "./start.sh"       # <-- Startscript (relativ zu SERVER_DIR)
+SERVER_DIR   = "/home/kype/desktop/Server"   # <-- Pfad zum Serverordner anpassen
+START_SCRIPT = "./startservr.sh"       # <-- Startscript (relativ zu SERVER_DIR)
 SCREEN_NAME  = "mcserver"
 MC_HOST      = "127.0.0.1"
 MC_PORT      = 25565
@@ -42,15 +42,26 @@ def _read_varint(sock):
             return num
     raise ValueError("VarInt too long")
 
+def is_port_open():
+    """Prüft nur ob der TCP-Port offen ist (Server läuft, aber vielleicht noch nicht pingbar)."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        result = sock.connect_ex((MC_HOST, MC_PORT))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
 def mc_ping():
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
+        sock.settimeout(10)  # ATM10 braucht länger zum Antworten
         sock.connect((MC_HOST, MC_PORT))
         host_b = MC_HOST.encode("utf-8")
         handshake = (
             b"\x00"
-            + _pack_varint(47)
+            + _pack_varint(767)          # Protokoll-Version 1.21 (aktueller als 47=1.8)
             + _pack_varint(len(host_b)) + host_b
             + struct.pack(">H", MC_PORT)
             + b"\x01"
@@ -60,26 +71,31 @@ def mc_ping():
         length = _read_varint(sock)
         data = b""
         while len(data) < length:
-            chunk = sock.recv(length - len(data))
+            chunk = sock.recv(min(4096, length - len(data)))
             if not chunk:
                 break
             data += chunk
         sock.close()
+        # Packet-ID VarInt überspringen
         pos = 0
-        while data[pos] & 0x80:
+        while pos < len(data) and (data[pos] & 0x80):
             pos += 1
         pos += 1
-        while data[pos] & 0x80:
+        # String-Länge VarInt überspringen
+        while pos < len(data) and (data[pos] & 0x80):
             pos += 1
         pos += 1
-        info = json.loads(data[pos:].decode("utf-8"))
-        return {"online": info["players"]["online"], "max": info["players"]["max"]}
+        if pos >= len(data):
+            return None
+        info = json.loads(data[pos:].decode("utf-8", errors="replace"))
+        players = info.get("players", {})
+        return {"online": players.get("online", 0), "max": players.get("max", 0)}
     except Exception:
         return None
 
 # ─── Hilfsfunktionen ──────────────────────────────────────────────────────────
 def is_screen_running():
-    r = subprocess.run(["screen", "-list"], capture_output=True, text=True)
+    r = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
     return SCREEN_NAME in r.stdout
 
 def send_stop():
@@ -381,10 +397,12 @@ async function fetchStatus() {
     const dot = document.getElementById('headerDot');
     const htxt = document.getElementById('headerStatusText');
     if (d.mc_online)          { dot.className='online';   htxt.textContent='ONLINE'; }
+    else if (d.port_open)     { dot.className='starting'; htxt.textContent='LÄDT...'; }
     else if (d.screen_running){ dot.className='starting'; htxt.textContent='STARTET...'; }
     else                      { dot.className='offline';  htxt.textContent='OFFLINE'; }
     const st = document.getElementById('statStatus');
     if (d.mc_online)           { st.textContent='Online';   st.className='stat-value green'; }
+    else if (d.port_open)      { st.textContent='Lädt…';    st.className='stat-value amber'; }
     else if (d.screen_running) { st.textContent='Startet…'; st.className='stat-value amber'; }
     else                       { st.textContent='Offline';  st.className='stat-value red';   }
     const pEl = document.getElementById('statPlayers');
@@ -435,8 +453,9 @@ def index():
 
 @app.route("/status")
 def status():
-    running = is_screen_running()
-    ping    = mc_ping() if running else None
+    running  = is_screen_running()
+    port_up  = is_port_open() if running else False
+    ping     = mc_ping()      if port_up  else None
     with state_lock:
         rem = None
         if state["auto_shutdown_enabled"] and state["empty_since"] is not None and running:
@@ -444,6 +463,7 @@ def status():
             rem = max(0, state["auto_shutdown_minutes"] * 60 - elapsed)
         return jsonify({
             "screen_running":        running,
+            "port_open":             port_up,
             "mc_online":             ping is not None,
             "player_count":          ping["online"] if ping else None,
             "player_max":            ping["max"]    if ping else None,
@@ -493,6 +513,19 @@ def settings():
             state["shutdown_triggered"] = False
     label = f"aktiviert ({minutes} Min.)" if enabled else "deaktiviert"
     return jsonify({"ok": True, "message": f"Auto-Shutdown {label}."})
+
+@app.route("/debug")
+def debug():
+    screen_out = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
+    return jsonify({
+        "screen_ls_stdout": screen_out.stdout,
+        "screen_ls_stderr": screen_out.stderr,
+        "screen_running":   SCREEN_NAME in screen_out.stdout,
+        "port_open":        is_port_open(),
+        "ping_result":      mc_ping(),
+        "server_dir":       SERVER_DIR,
+        "start_script":     START_SCRIPT,
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
