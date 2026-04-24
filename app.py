@@ -5,7 +5,7 @@ app = Flask(__name__)
 
 # ─── Konfiguration ────────────────────────────────────────────────────────────
 SERVER_DIR   = "/home/kype/desktop/Server"   # <-- Pfad zum Serverordner anpassen
-START_SCRIPT = "./startservr.sh"       # <-- Startscript (relativ zu SERVER_DIR)
+START_SCRIPT = "./startserver.sh"       # <-- Startscript (relativ zu SERVER_DIR)
 SCREEN_NAME  = "mcserver"
 MC_HOST      = "127.0.0.1"
 MC_PORT      = 25565
@@ -53,15 +53,18 @@ def is_port_open():
     except Exception:
         return False
 
+_last_ping_error = ""
+
 def mc_ping():
+    global _last_ping_error
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)  # ATM10 braucht länger zum Antworten
+        sock.settimeout(10)
         sock.connect((MC_HOST, MC_PORT))
         host_b = MC_HOST.encode("utf-8")
         handshake = (
             b"\x00"
-            + _pack_varint(767)          # Protokoll-Version 1.21 (aktueller als 47=1.8)
+            + _pack_varint(767)
             + _pack_varint(len(host_b)) + host_b
             + struct.pack(">H", MC_PORT)
             + b"\x01"
@@ -86,11 +89,15 @@ def mc_ping():
             pos += 1
         pos += 1
         if pos >= len(data):
+            _last_ping_error = "Kein JSON nach VarInts"
             return None
         info = json.loads(data[pos:].decode("utf-8", errors="replace"))
-        players = info.get("players", {})
+        # "players" kann None sein (z.B. bei NeoForge/ATM10)
+        players = info.get("players") or {}
+        _last_ping_error = ""
         return {"online": players.get("online", 0), "max": players.get("max", 0)}
-    except Exception:
+    except Exception as e:
+        _last_ping_error = f"{type(e).__name__}: {e}"
         return None
 
 # ─── Hilfsfunktionen ──────────────────────────────────────────────────────────
@@ -99,7 +106,22 @@ def is_screen_running():
     return SCREEN_NAME in r.stdout
 
 def send_stop():
+    # Erst `stop` an Minecraft schicken (damit die Welt gespeichert wird)
     subprocess.run(["screen", "-S", SCREEN_NAME, "-X", "stuff", "stop\n"])
+    # Im Hintergrund warten bis MC gestoppt ist, dann Screen-Session killen
+    # (verhindert dass das Start-Script den Server nach 10s neustartet)
+    threading.Thread(target=_kill_screen_when_stopped, daemon=True).start()
+
+def _kill_screen_when_stopped():
+    """Wartet bis der MC-Port geschlossen ist, dann beendet die Screen-Session."""
+    time.sleep(5)  # kurz warten damit MC den Stop-Befehl verarbeitet
+    deadline = time.time() + 120  # max. 2 Minuten warten
+    while time.time() < deadline:
+        if not is_port_open():
+            break
+        time.sleep(2)
+    time.sleep(3)  # kleiner Puffer für finales Speichern
+    subprocess.run(["screen", "-S", SCREEN_NAME, "-X", "quit"])
 
 def get_log_tail(lines=25):
     log_path = f"/tmp/{SCREEN_NAME}.log"
@@ -517,12 +539,15 @@ def settings():
 @app.route("/debug")
 def debug():
     screen_out = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
+    port_up    = is_port_open()
+    ping       = mc_ping() if port_up else None
     return jsonify({
         "screen_ls_stdout": screen_out.stdout,
         "screen_ls_stderr": screen_out.stderr,
         "screen_running":   SCREEN_NAME in screen_out.stdout,
-        "port_open":        is_port_open(),
-        "ping_result":      mc_ping(),
+        "port_open":        port_up,
+        "ping_result":      ping,
+        "last_ping_error":  _last_ping_error,
         "server_dir":       SERVER_DIR,
         "start_script":     START_SCRIPT,
     })
