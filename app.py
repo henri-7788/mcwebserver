@@ -4,7 +4,7 @@ import subprocess, os, socket, struct, json, threading, time
 app = Flask(__name__)
 
 # ─── Konfiguration ────────────────────────────────────────────────────────────
-SERVER_DIR   = "/home/kype/desktop/Server"   # <-- Pfad zum Serverordner anpassen
+SERVER_DIR   = "/home/kype/Desktop/Server"   # <-- Pfad zum Serverordner anpassen
 START_SCRIPT = "./startserver.sh"       # <-- Startscript (relativ zu SERVER_DIR)
 SCREEN_NAME  = "mcserver"
 MC_HOST      = "127.0.0.1"
