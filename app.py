@@ -443,10 +443,6 @@ async function fetchStatus() {
 async function doAction(cmd) {
   document.getElementById('btnStart').disabled = true;
   document.getElementById('btnStop').disabled  = true;
-  if (cmd === 'start') {
-    const c = document.getElementById('console');
-    c.textContent = '';
-  }
   try {
     const d = await (await fetch('/'+cmd,{method:'POST'})).json();
     showToast(d.message, d.ok?'ok':'err');
@@ -468,32 +464,61 @@ async function saveSettings() {
 // ── Echtzeit-Konsole via Server-Sent Events ──────────────────────────────────
 (function connectConsole() {
   const c = document.getElementById('console');
-  let autoScroll = true;
   const MAX_LINES = 500;
+  let autoScroll = true;
+  let lineCount   = 0;
+  let pending     = [];   // Zeilen-Puffer
+  let rafPending  = false;
 
   c.addEventListener('scroll', () => {
     autoScroll = c.scrollHeight - c.clientHeight <= c.scrollTop + 40;
   });
 
-  const es = new EventSource('/console-stream');
-
-  es.onmessage = (e) => {
-    const line = JSON.parse(e.data);
-    const wasEmpty = c.textContent === '' || c.textContent === 'Warte auf Log-Ausgabe...';
-    if (wasEmpty) c.textContent = '';
-    c.textContent += line + '\n';
-    // Puffergröße begrenzen
-    const lines = c.textContent.split('\n');
-    if (lines.length > MAX_LINES) {
-      c.textContent = lines.slice(lines.length - MAX_LINES).join('\n');
+  // DOM-Update auf Animation-Frame drosseln → kein Event-Loop-Freeze
+  function flush() {
+    rafPending = false;
+    if (pending.length === 0) return;
+    if (c.textContent === 'Warte auf Log-Ausgabe...') c.textContent = '';
+    c.textContent += pending.join('\n') + '\n';
+    lineCount += pending.length;
+    pending = [];
+    // Puffer kürzen wenn nötig (nur alle 100 Zeilen prüfen)
+    if (lineCount > MAX_LINES + 100) {
+      const all = c.textContent.split('\n');
+      c.textContent = all.slice(all.length - MAX_LINES).join('\n');
+      lineCount = MAX_LINES;
     }
     if (autoScroll) c.scrollTop = c.scrollHeight;
-  };
+  }
 
-  es.onerror = () => {
-    es.close();
-    setTimeout(connectConsole, 3000); // nach 3s neu verbinden
-  };
+  function scheduleFlush() {
+    if (!rafPending) { rafPending = true; requestAnimationFrame(flush); }
+  }
+
+  let es;
+  function connect() {
+    es = new EventSource('/console-stream');
+
+    // Normaler Log-Batch (Array von Zeilen)
+    es.onmessage = (e) => {
+      const lines = JSON.parse(e.data);
+      pending.push(...(Array.isArray(lines) ? lines : [lines]));
+      scheduleFlush();
+    };
+
+    // Server meldet: Log wurde geleert (Server-Neustart)
+    es.addEventListener('clear', () => {
+      pending = [];
+      c.textContent = '';
+      lineCount = 0;
+    });
+
+    es.onerror = () => {
+      es.close();
+      setTimeout(connect, 3000);
+    };
+  }
+  connect();
 })();
 
 fetchStatus();
@@ -575,33 +600,38 @@ def console_stream():
     def generate():
         log_path = f"/tmp/{SCREEN_NAME}.log"
         byte_pos = 0
-        # Zuerst die letzten 60 Zeilen des bestehenden Logs senden
+        # Letzten 60 Zeilen als initialen Batch senden
         try:
             if os.path.exists(log_path):
                 with open(log_path, "rb") as f:
                     content = f.read()
                 byte_pos = len(content)
                 lines = content.decode("utf-8", errors="replace").splitlines()
-                for line in lines[-60:]:
-                    yield f"data: {json.dumps(line)}\n\n"
+                batch = [l for l in lines[-60:] if l]
+                if batch:
+                    yield f"data: {json.dumps(batch)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps(f'[Log-Fehler: {e}]')}\n\n"
-        # Neue Zeilen streamen sobald sie erscheinen
+            yield f"data: {json.dumps([f'[Log-Fehler: {e}]'])}\n\n"
+        # Neue Zeilen streamen
         while True:
             try:
                 if os.path.exists(log_path):
+                    file_size = os.path.getsize(log_path)
+                    if file_size < byte_pos:
+                        # Log wurde geleert (Server-Neustart) → Client zurücksetzen
+                        byte_pos = 0
+                        yield "event: clear\ndata: {}\n\n"
                     with open(log_path, "rb") as f:
                         f.seek(byte_pos)
                         new_data = f.read()
                     if new_data:
                         byte_pos += len(new_data)
-                        text = new_data.decode("utf-8", errors="replace")
-                        for line in text.splitlines():
-                            if line:
-                                yield f"data: {json.dumps(line)}\n\n"
+                        batch = [l for l in new_data.decode("utf-8", errors="replace").splitlines() if l]
+                        if batch:
+                            yield f"data: {json.dumps(batch)}\n\n"
             except Exception:
                 pass
-            time.sleep(0.4)
+            time.sleep(0.5)
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
