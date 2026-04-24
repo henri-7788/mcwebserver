@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, Response, stream_with_context
 import subprocess, os, socket, struct, json, threading, time
 
 app = Flask(__name__)
@@ -437,13 +437,16 @@ async function fetchStatus() {
     document.getElementById('toggleEnabled').checked = d.auto_shutdown_enabled;
     document.getElementById('toggleLabel').textContent = d.auto_shutdown_enabled ? 'Auto-Shutdown aktiv' : 'Auto-Shutdown deaktiviert';
     document.getElementById('inputMinutes').value = d.auto_shutdown_minutes;
-    if (d.log) { const c=document.getElementById('console'); c.textContent=d.log; c.scrollTop=c.scrollHeight; }
   } catch(e) { document.getElementById('headerStatusText').textContent='Fehler'; }
 }
 
 async function doAction(cmd) {
   document.getElementById('btnStart').disabled = true;
   document.getElementById('btnStop').disabled  = true;
+  if (cmd === 'start') {
+    const c = document.getElementById('console');
+    c.textContent = '';
+  }
   try {
     const d = await (await fetch('/'+cmd,{method:'POST'})).json();
     showToast(d.message, d.ok?'ok':'err');
@@ -461,6 +464,37 @@ async function saveSettings() {
     fetchStatus();
   } catch(e) { showToast('Fehler beim Speichern','err'); }
 }
+
+// ── Echtzeit-Konsole via Server-Sent Events ──────────────────────────────────
+(function connectConsole() {
+  const c = document.getElementById('console');
+  let autoScroll = true;
+  const MAX_LINES = 500;
+
+  c.addEventListener('scroll', () => {
+    autoScroll = c.scrollHeight - c.clientHeight <= c.scrollTop + 40;
+  });
+
+  const es = new EventSource('/console-stream');
+
+  es.onmessage = (e) => {
+    const line = JSON.parse(e.data);
+    const wasEmpty = c.textContent === '' || c.textContent === 'Warte auf Log-Ausgabe...';
+    if (wasEmpty) c.textContent = '';
+    c.textContent += line + '\n';
+    // Puffergröße begrenzen
+    const lines = c.textContent.split('\n');
+    if (lines.length > MAX_LINES) {
+      c.textContent = lines.slice(lines.length - MAX_LINES).join('\n');
+    }
+    if (autoScroll) c.scrollTop = c.scrollHeight;
+  };
+
+  es.onerror = () => {
+    es.close();
+    setTimeout(connectConsole, 3000); // nach 3s neu verbinden
+  };
+})();
 
 fetchStatus();
 setInterval(fetchStatus, 15000);
@@ -492,7 +526,6 @@ def status():
             "auto_shutdown_enabled": state["auto_shutdown_enabled"],
             "auto_shutdown_minutes": state["auto_shutdown_minutes"],
             "remaining_seconds":     rem,
-            "log":                   get_log_tail(),
         })
 
 @app.route("/start", methods=["POST"])
@@ -536,6 +569,42 @@ def settings():
     label = f"aktiviert ({minutes} Min.)" if enabled else "deaktiviert"
     return jsonify({"ok": True, "message": f"Auto-Shutdown {label}."})
 
+@app.route("/console-stream")
+def console_stream():
+    @stream_with_context
+    def generate():
+        log_path = f"/tmp/{SCREEN_NAME}.log"
+        byte_pos = 0
+        # Zuerst die letzten 60 Zeilen des bestehenden Logs senden
+        try:
+            if os.path.exists(log_path):
+                with open(log_path, "rb") as f:
+                    content = f.read()
+                byte_pos = len(content)
+                lines = content.decode("utf-8", errors="replace").splitlines()
+                for line in lines[-60:]:
+                    yield f"data: {json.dumps(line)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps(f'[Log-Fehler: {e}]')}\n\n"
+        # Neue Zeilen streamen sobald sie erscheinen
+        while True:
+            try:
+                if os.path.exists(log_path):
+                    with open(log_path, "rb") as f:
+                        f.seek(byte_pos)
+                        new_data = f.read()
+                    if new_data:
+                        byte_pos += len(new_data)
+                        text = new_data.decode("utf-8", errors="replace")
+                        for line in text.splitlines():
+                            if line:
+                                yield f"data: {json.dumps(line)}\n\n"
+            except Exception:
+                pass
+            time.sleep(0.4)
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 @app.route("/debug")
 def debug():
     screen_out = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
@@ -553,4 +622,4 @@ def debug():
     })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=8080, threaded=True)
